@@ -1,0 +1,129 @@
+import os
+import numpy as np
+import pandas as pd
+import math
+import cv2
+from skimage import io, measure, morphology, util
+from skimage.morphology import skeletonize, remove_small_holes, remove_small_objects
+from scipy import ndimage as ndi
+import ace_tools as tools
+
+# 图像路径
+image_files = [
+    "/mnt/data/20230831_11p_17.tif",
+    "/mnt/data/20230824_15p_18.tif",
+    "/mnt/data/20230824_14p_18.tif",
+    "/mnt/data/20230823_13p_17.tif",
+    "/mnt/data/20230823_10p_17.tif",
+    "/mnt/data/20230822_12p_21.tif"
+]
+
+# 灰度读取 & 归一化到 8-bit
+def imread_gray_8bit(path: str):
+    img = io.imread(path)
+    if img.ndim == 3:
+        if img.dtype != np.uint8:
+            img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    else:
+        if img.dtype != np.uint8:
+            img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    return img
+
+# 图像增强与处理
+def enhance_contrast(img): return cv2.createCLAHE(2.0, (8,8)).apply(img)
+def denoise(img): return cv2.bilateralFilter(img, 5, 10, 10)
+def binarize_pores(img):
+    blur = cv2.GaussianBlur(img, (3, 3), 0)
+    _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ad = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 5)
+    comb = ((otsu > 0).astype(np.uint8) + (ad > 0).astype(np.uint8)) >= 1
+    return comb if 0.2 <= comb.mean() <= 0.95 else (~comb)
+def clean_binary(bin_img): return remove_small_holes(remove_small_objects(bin_img, 25), 25)
+
+# 分析特征
+def eq_diameter_from_region(region): return region.equivalent_diameter
+def compute_shape_descriptors(regions):
+    circularities, aspect_ratios, solidities, eq_diams = [], [], [], []
+    for r in regions:
+        area = r.area
+        perimeter = r.perimeter if r.perimeter > 0 else 1.0
+        circularity = 4.0 * math.pi * area / (perimeter ** 2)
+        minr, minc, maxr, maxc = r.bbox
+        h = maxr - minr; w = maxc - minc
+        ar = (max(h, w) / (min(h, w) + 1e-6))
+        circularities.append(circularity)
+        aspect_ratios.append(ar)
+        solidities.append(r.solidity if hasattr(r, "solidity") else np.nan)
+        eq_diams.append(eq_diameter_from_region(r))
+    return (np.nanmean(circularities), np.nanmean(aspect_ratios),
+            np.nanmean(solidities), eq_diams)
+
+def distance_watershed(binary_mask):
+    distance = ndi.distance_transform_edt(binary_mask)
+    local_max = morphology.local_maxima(distance)
+    markers, _ = ndi.label(local_max)
+    return morphology.watershed(-distance, markers, mask=binary_mask)
+
+def skeleton_metrics(solid_mask):
+    skel = skeletonize(solid_mask)
+    length_px = skel.sum()
+    area_px = skel.size
+    density = length_px / area_px
+    kernel = np.array([[1,1,1],[1,10,1],[1,1,1]], dtype=np.uint8)
+    neigh = cv2.filter2D(skel.astype(np.uint8), -1, kernel)
+    neighbors = neigh - 10
+    return (density, int(((neighbors >= 3) & skel).sum()), int(((neighbors == 1) & skel).sum()))
+
+def fractal_dimension(binary_mask):
+    img = util.img_as_ubyte(binary_mask > 0)
+    sizes, counts = [], []
+    h, w = img.shape
+    s = 1
+    while s <= min(h, w):
+        cropped = img[:(h // s) * s, :(w // s) * s]
+        view = cropped.reshape((h // s, s, w // s, s))
+        block_sum = view.sum(axis=(1,3))
+        count = np.count_nonzero(block_sum)
+        if count > 0:
+            sizes.append(1.0 / s)
+            counts.append(count)
+        s *= 2
+    if len(sizes) < 2: return np.nan
+    return float(np.polyfit(np.log(sizes), np.log(counts), 1)[0])
+
+# 主处理
+rows = []
+for path in image_files:
+    row = {"image_name": os.path.basename(path)}
+    try:
+        img = imread_gray_8bit(path)
+        proc = denoise(enhance_contrast(img))
+        pores = clean_binary(binarize_pores(proc))
+        labels = distance_watershed(pores)
+        regions = measure.regionprops(labels)
+        circ, ar, sol, eq_diams = compute_shape_descriptors(regions)
+        porosity = pores.mean()
+        skel_len, branch, end = skeleton_metrics(~pores)
+        fd = fractal_dimension(pores)
+        row.update({
+            "porosity_px": porosity,
+            "pore_count": len(regions),
+            "mean_pore_diam_px": np.nanmean(eq_diams),
+            "median_pore_diam_px": np.nanmedian(eq_diams),
+            "std_pore_diam_px": np.nanstd(eq_diams),
+            "mean_pore_circularity": circ,
+            "mean_pore_aspect_ratio": ar,
+            "mean_pore_solidity": sol,
+            "skeleton_length_density": skel_len,
+            "skeleton_branch_points": branch,
+            "skeleton_end_points": end,
+            "fractal_dimension": fd,
+            "error": ""
+        })
+    except Exception as e:
+        row["error"] = str(e)
+    rows.append(row)
+
+df = pd.DataFrame(rows)
+tools.display_dataframe_to_user(name="最终修正分析结果（像素单位）", dataframe=df)
