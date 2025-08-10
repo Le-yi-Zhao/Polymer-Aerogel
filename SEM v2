@@ -24,8 +24,7 @@ from skimage import filters
 from scipy import ndimage as ndi
 from skimage import img_as_ubyte
 import pathlib, inspect, os
-
-# 设定结果文件夹路径
+# 把 results 放到本脚本所在目录
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 RESULT_DIR = SCRIPT_DIR / "results"
 RESULT_DIR.mkdir(exist_ok=True)
@@ -38,30 +37,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger()
 
-# 图像文件路径（这里使用上传的图像路径）
 image_paths = [
-    "/mnt/data/20230822_12p_21.tif",
-    "/mnt/data/20230823_13p_17.tif",
-    "/mnt/data/20230824_14p_18.tif",
-    "/mnt/data/20230823_10p_17.tif",
-    "/mnt/data/20230824_15p_18.tif",
-    "/mnt/data/20230831_11p_17.tif"
+    "C:/Users/zhaol/Desktop/codexex/polymer_analysis/Aerogel_SEM/20230822_12p_21.tif",
+    "C:/Users/zhaol/Desktop/codexex/polymer_analysis/Aerogel_SEM/20230823_13p_17.tif",
+    "C:/Users/zhaol/Desktop/codexex/polymer_analysis/Aerogel_SEM/20230824_14p_18.tif",
+    "C:/Users/zhaol/Desktop/codexex/polymer_analysis/Aerogel_SEM/20230823_10p_17.tif",
+    "C:/Users/zhaol/Desktop/codexex/polymer_analysis/Aerogel_SEM/20230824_15p_18.tif",
+    "C:/Users/zhaol/Desktop/codexex/polymer_analysis/Aerogel_SEM/20230831_11p_17.tif"
 ]
 
-# 设置绘图风格
 sns.set(style="whitegrid", palette="muted")
 plt.rcParams['font.family'] = ['SimHei', 'Arial', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 plt.rcParams['figure.figsize'] = (12, 8)
-
 def imread_gray_8bit(img_path: str) -> np.ndarray:
     """读取图像并转为8位灰度图"""
-    try:
-        img = io.imread(img_path, as_gray=True)
-        return (img * 255).astype(np.uint8)
-    except Exception as e:
-        logger.error(f"无法读取图像 {img_path}: {e}")
-        return None
+    img = io.imread(img_path, as_gray=True)
+    return (img * 255).astype(np.uint8)
 
 def enhance_contrast(img: np.ndarray) -> np.ndarray:
     """增强对比度（使用CLAHE）"""
@@ -87,8 +79,6 @@ def extract_porosity_features(img_path: str):
     """提取所有孔隙/骨架特征"""
     # 1. 读取-预处理-二值化
     img = imread_gray_8bit(img_path)
-    if img is None:
-        return None  # 图像加载失败则返回 None
     img = enhance_contrast(img)
     img = denoise(img)
     binary = binarize_pores(img)
@@ -136,7 +126,12 @@ def extract_porosity_features(img_path: str):
     }
 
 
-# 分形维数计算函数（盒计数法）
+
+
+# 图像处理：提取孔隙特征
+# 因为下面的部分连通性很差，不会被检测到，所以这里就不再进行裁剪或者检测了
+
+# 计算分形维数的函数（基于盒计数法）
 def calculate_fractal_dimension(binary_img: np.ndarray) -> float:
     """
     简化版盒计数法，输入为二值骨架 (True/False)。
@@ -150,7 +145,6 @@ def calculate_fractal_dimension(binary_img: np.ndarray) -> float:
     coeffs = np.polyfit(np.log(sizes), np.log(counts), 1)
     return -coeffs[0]
 
-# 计算分形维数的函数（基于盒计数法）
 def calculate_fractal_dimension(binary_img: np.ndarray) -> float:
     """
     盒计数法计算二值图的分形维数。
@@ -188,32 +182,116 @@ def calculate_fractal_dimension(binary_img: np.ndarray) -> float:
     fractal_dimension = -coeffs[0]   # 因为 log N = -D log ε + C
     return fractal_dimension
 
+def validate_data(pva_df):
+    try:
+        pva_cols = ['concentration', 'density', 'volume_shrinkage', 'modulus', 'modulus_std', 'transmittance']
+        if not all(col in pva_df.columns for col in pva_cols):
+            logger.error(f"PVA气凝胶数据缺少必要列: {set(pva_cols) - set(pva_df.columns)}")
+            return False
+        if not pva_df['concentration'].dtype in [np.float64, np.int64]:
+            logger.error(f"PVA气凝胶数据的浓度列必须为数值类型")
+            return False
+        if not (pva_df['concentration'] > 0).all():
+            logger.error(f"PVA气凝胶数据包含非正浓度值")
+            return False
+        missing = pva_df.isnull().sum().sum()
+        if missing > 0:
+            logger.warning(f"PVA气凝胶数据包含{missing}个缺失值")
+        logger.info("数据验证通过")
+        return True
+    except Exception as e:
+        logger.error(f"数据验证失败: {e}")
+        return False
+def expand_concentration_range(df: pd.DataFrame,
+                               target_samples: int,
+                               conc_col: str = 'concentration') -> pd.DataFrame:
+    """
+    把浓度范围扩展到 target_samples 行。
+    1. 如果行数 ≥ target_samples，直接返回；
+    2. 否则，以浓度为自变量，对其余数值列做线性插值。
+    """
+    if len(df) >= target_samples:
+        return df.reset_index(drop=True)
+
+    # 按浓度排序
+    df = df.sort_values(conc_col).reset_index(drop=True)
+
+    # 构造新的浓度轴
+    new_conc = np.linspace(df[conc_col].min(), df[conc_col].max(), target_samples)
+
+    # 逐列插值
+    interp_df = {conc_col: new_conc}
+    for col in df.columns:
+        if col == conc_col:
+            continue
+        interp_df[col] = np.interp(new_conc, df[conc_col], df[col])
+
+    return pd.DataFrame(interp_df)
 def load_and_preprocess_data(image_paths, expand=True, target_samples=200):
-    logger.info("开始图像数据分析...")
-    features = []
-    for img_path in image_paths:
-        features.append(extract_porosity_features(img_path))
-    df = pd.DataFrame(features)
-    return df
+    start_time = time.time()
+    cache_file = Path("results/cached_dataset.csv")
+    if cache_file.exists():
+        logger.info("加载缓存数据集")
+        try:
+            final_df = pd.read_csv(cache_file)
+            logger.info(f"从缓存加载数据集，耗时{time.time() - start_time:.2f}秒")
+            return final_df
+        except Exception as e:
+            logger.warning(f"缓存加载失败: {e}，重新处理数据")
+    try:
+        pva_df = pd.read_excel("PVA Aerogel Data.xlsx", sheet_name="Sheet2")
+        pva_df.columns = ['concentration', 'density', 'volume_shrinkage', 'modulus', 'modulus_std', 'transmittance']
+        if not validate_data(pva_df):
+            return None
+        # 提取图像特征并将其与浓度相匹配
+        porosity_features = []
+        for img_path in image_paths:
+            features = extract_porosity_features(img_path)
+            stem = Path(img_path).stem
+            features['concentration'] = float(stem.split('_')[1].split('p')[0])  # 假设图片文件名包含浓度信息
+            porosity_features.append(features)
+
+        # 将图像特征整合到PVA DataFrame中
+        porosity_df = pd.DataFrame(porosity_features)
+        pva_df = pd.merge(pva_df, porosity_df, on='concentration', how='left')
+
+        imputer = KNNImputer(n_neighbors=3)
+        pva_df[['modulus', 'modulus_std']] = imputer.fit_transform(pva_df[['modulus', 'modulus_std']])
+
+        # 扩展浓度范围
+        if expand:
+            logger.info(f"原始样本数: {len(pva_df)}")
+            pva_df = expand_concentration_range(pva_df, target_samples)
+            logger.info(f"扩展后样本数: {len(pva_df)}")
+
+        pva_df.to_csv(cache_file, index=False)
+        logger.info(f"数据预处理完成，缓存保存至{cache_file}，耗时{time.time() - start_time:.2f}秒")
+        return pva_df
+    except FileNotFoundError as e:
+        logger.error(f"数据文件未找到: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"数据加载或预处理失败: {e}")
+        return None
 
 # 执行数据分析：可以在此进行进一步的建模或其他分析
 def analyze_pva_features(pva_df):
     logger.info("PVA气凝胶数据的特征分析：" + str(pva_df.describe()))
     return pva_df
-
-# 运行
 if __name__ == "__main__":
-    print(">>> 脚本已开始运行 <<<")
-    df = load_and_preprocess_data(image_paths, expand=True, target_samples=200)
-    if df is not None:
+     print(">>> 脚本已开始运行 <<<")
+     df = load_and_preprocess_data(image_paths, expand=True, target_samples=200)
+     if df is not None:
         df = analyze_pva_features(df)
 
         # 自动保存到 results/ 目录
         save_path = RESULT_DIR / f"pva_features_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
         df.to_csv(save_path, index=False, encoding='utf-8-sig')
         logger.info(f"特征表格已保存至: {save_path}")
-    logger.info("=== 测试日志 ===")
-    logging.shutdown()
-    log_path = RESULT_DIR / "aerogel_analysis.log"
-    print("日志文件绝对路径：", log_path.resolve())
-
+logger.info("=== 测试日志 ===")
+logging.shutdown()          # 强制把缓冲区的内容刷到硬盘
+log_path = RESULT_DIR / "aerogel_analysis.log"
+logging.basicConfig(
+    filename=log_path,
+)
+print("日志文件绝对路径：", log_path.resolve())
