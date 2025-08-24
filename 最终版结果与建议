@@ -1,0 +1,134 @@
+
+
+## 一、这次分析用到的设定（自动识别）
+
+* **使用的表**：`Sheet1`
+* **目标列（Transsmittance）**：`Transsmittance(%*nm)(380-780)`
+* **时间顺序分组（实际识别并参与BN学习的子集）**：
+
+  1. `Concentration`
+  2. `porosity_px`
+  3. （微结构中识别到并进入Top-K的）`mean_pore_solidity`
+  4. 末组：`density(mg/mm^3)`, `Volume Shrinkage`, `Modulus(MPa)`, `STDEV.S`, `Transsmittance(%*nm)(380-780)`
+
+> 说明：我做了**模糊匹配**来适配列名差异，并在“随机森林Top-K + 锚点（Concentration、porosity、Transsmittance）”的约束下选择进入BN的变量，确保既控制维度，又不丢掉关键锚点与物理合理性。
+
+---
+
+## 二、关键指标（新文件）
+
+* **PCA**：累计方差达 **90%** 需要 **3 个主成分**（k90 = 3）。
+* **随机森林特征重要性（Top 10）**：
+  `Volume Shrinkage, STDEV.S, density(mg/mm^3), Concentration, Modulus(MPa), mean_pore_solidity, skeleton_branch_points, porosity_px, fractal_dimension, skeleton_length_density`
+* **进入BN建模的实际变量顺序**：
+  `Concentration → porosity_px → mean_pore_solidity → [density(mg/mm^3), Volume Shrinkage, Modulus(MPa), STDEV.S, Transsmittance(%*nm)(380-780)]`
+* **最终稳定DAG边数（阈值≥0.5）**：**13 条**
+* **从 Concentration 到 Transsmittance 的可达解释路径数**：**3 条**
+
+---
+
+## 三、从 Concentration 到 Transsmittance 的主路径（基于稳定结构）
+
+本次在新文件上得到的3条路径（详情见CSV）通常包含如下两类中介：
+
+1. **孔隙—致密—光学链**
+   `Concentration → porosity_px → mean_pore_solidity → density(mg/mm^3) → Transsmittance`
+
+2. **孔隙直接影响光学**
+   `Concentration → porosity_px → Transsmittance`
+
+3. **孔隙—体缩/宏观性质—光学**
+   `Concentration → porosity_px → Volume Shrinkage（或 Modulus/ STDEV.S） → Transsmittance`
+
+> 这与材料机理直觉一致：配方（Concentration）影响孔隙度与孔隙“实心度”（solidity），进而影响密度/体缩等宏观量，最终作用到透射率。
+
+---
+
+## 四、下载结果（新文件版）
+
+* **PCA 累计方差图**（k90标注）：
+  [pca\_cumulative\_variance\_NEW.png](sandbox:/mnt/data/pca_cumulative_variance_NEW.png)
+* **随机森林特征重要性图**（Top 10）：
+  [rf\_feature\_importances\_NEW.png](sandbox:/mnt/data/rf_feature_importances_NEW.png)
+* **结构学习边频率热图**（稳定性选择）：
+  [edge\_frequency\_heatmap\_bn\_integrated\_NEW.png](sandbox:/mnt/data/edge_frequency_heatmap_bn_integrated_NEW.png)
+* **最终BN结构图**（Transsmittance节点加大强调）：
+  [bn\_graph\_integrated\_NEW.png](sandbox:/mnt/data/bn_graph_integrated_NEW.png)
+* **稳定边与频率（完整表）**：
+  [bn\_edges\_selected\_NEW.csv](sandbox:/mnt/data/bn_edges_selected_NEW.csv)
+* **从 Concentration 到 Transsmittance 的路径**：
+  [bn\_paths\_to\_transsmittance\_NEW.csv](sandbox:/mnt/data/bn_paths_to_transsmittance_NEW.csv)
+* **RF特征重要性完整表**：
+  [rf\_feature\_importances\_table\_NEW.csv](sandbox:/mnt/data/rf_feature_importances_table_NEW.csv)
+* **PCA解释方差表**：
+  [pca\_explained\_variance\_table\_NEW.csv](sandbox:/mnt/data/pca_explained_variance_table_NEW.csv)
+* **简要结构/路径预览（如表格弹出受限）**：
+  [edges\_top20\_preview\_NEW.csv](sandbox:/mnt/data/edges_top20_preview_NEW.csv)
+  [paths\_to\_transsmittance\_preview\_NEW.csv](sandbox:/mnt/data/paths_to_transsmittance_preview_NEW.csv)
+* **运行摘要（JSON）**：
+  [summary\_NEW.json](sandbox:/mnt/data/summary_NEW.json)
+
+---
+
+## 五、针对新文件的结论与建议
+
+### 1) 变量与路径解读
+
+* **porosity\_px** 与 **mean\_pore\_solidity** 是本次稳定网络中**最关键的微结构中介**；它们与 **density、Volume Shrinkage** 共同构成连接至 **Transsmittance** 的桥梁。
+* 随机森林显示 **Volume Shrinkage、STDEV.S、density** 的重要性靠前，提示**宏观致密/成形过程特征**对光学透射率的解释力更强于某些细粒度形状参数。
+
+**建议**：
+
+* 在实验设计上，围绕 `Concentration → porosity_px / mean_pore_solidity → density / Volume Shrinkage → Transsmittance` 的链路做**因子设计/对照实验**，验证每个环节对光学指标的**边际影响**。
+* 若能记录更细的**时间序列**（如烧结/固化阶段的过程变量），可进一步加上过程变量作为“更早层”节点，提升方向识别可靠性。
+
+### 2) 数据角度
+
+* 以 **k90=3** 的结果看，增强数据的统计结构较为集中，**低维空间即可刻画主变化**。
+* 建议在后续实验中**补充真实样本**（特别是不同浓度/孔隙区间的点），再按本流程复跑，可显著提升边频率的可信度与方向稳定性。
+
+### 3) 方法与建模改进
+
+* 当前 BN 学习使用 **Lasso + Bootstrap** 的**稳定性选择**，在小样本/增强场景下较为稳妥。但若后续允许安装库：
+
+  * 可换用 **MMHC/GES**（`pgmpy`/`bnlearn`），并在评分函数使用 **BDeu/BIC** 进行**敏感性分析**；
+  * 引入 **结构先验**（边白/黑名单、父数上限）与**参数先验**，提升可解释性与抗过拟合能力。
+
+---
+
+## 六、后续可执行的优化方向（性能 + 可靠性）
+
+**性能优化**
+
+1. **并行化**
+
+   * `RandomForestRegressor(n_jobs=-1)`；
+   * Bootstrap结构学习循环用 `joblib.Parallel` 并行；
+   * `LassoCV` 可固定 `alphas` 并改用 `n_jobs=-1` 的并行CV（或先离线寻优一个 α 再用 `Lasso(alpha=...)`）。
+2. **缓存与复用**
+
+   * 在每轮bootstrap中，父集合不变时缓存标准化后的**子矩阵**与 `XᵀX`、`Xᵀy`，避免重复计算；
+   * 标准化器 `scaler` 只拟合一次，对自助样本直接 `transform`。
+3. **自适应停止**
+
+   * 边频率在后半程滚动窗口内变化 < 0.02 即提前终止（从 80 轮自适应降到 \~40–60 轮）。
+
+**可靠性优化**
+
+1. **更强的先验约束**
+
+   * 在**末组**之间可设**禁止相互为父**（例如只允许 microstructure → density/Volume Shrinkage → Transsmittance 的方向），减少“近邻横连”。
+2. **多阈值敏感性**
+
+   * 对 `FREQ_THRESHOLD` = 0.4/0.6、`MAX_PARENTS` = 1/3、`TOP_K_RF` = 4/8 运行对比，出**重叠边集**与**路径稳定性曲线**，量化不确定性。
+3. **增强策略**
+
+   * 如果后续支持 `imblearn`，建议尝试 **SMOTER（回归版）**；
+   * 或改为 **Copula后验采样** 并进行**多组参数后验**抽样，更好地反映不确定性。
+
+---
+
+如果你希望，我可以**进一步定制**输出：
+
+* 只聚焦 **Transsmittance** 的**路径贡献排名**（例如通过替换/剔除某边后的路径覆盖变化来给“路径重要性”打分）；
+* 或把 **Modulus**、**STDEV.S** 各自作为末端指标再跑一遍，给出三者的**差异化路径比较图**。
