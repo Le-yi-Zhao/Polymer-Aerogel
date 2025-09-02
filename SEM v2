@@ -36,7 +36,7 @@ logging.basicConfig(
     encoding="utf-8"
 )
 logger = logging.getLogger()
-
+# 这里使用的是绝对路径，更换环境后需要重新配置文件环境
 image_paths = [
     "C:/Users/zhaol/Desktop/codexex/polymer_analysis/Aerogel_SEM/20230822_12p_21.tif",
     "C:/Users/zhaol/Desktop/codexex/polymer_analysis/Aerogel_SEM/20230823_13p_17.tif",
