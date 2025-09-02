@@ -1,0 +1,253 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pymc as pm
+import arviz as az
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score
+import shap
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# ========= 设置绘图风格 =========
+sns.set(style="whitegrid", palette="muted")
+plt.rcParams['font.family'] = ['DejaVu Sans', 'Arial', 'sans-serif']
+plt.rcParams['figure.figsize'] = (12, 8)
+
+# ========= 数据验证函数 =========
+def validate_data(particle_df, pore_df, pva_df):
+    """验证输入数据的完整性和一致性"""
+    try:
+        # 检查必要列
+        particle_cols = ['concentration', 'particle_mean', 'particle_std']
+        pore_cols = ['concentration', 'pore_mean', 'pore_std']
+        pva_cols = ['concentration', 'density', 'volume_shrinkage', 'modulus', 'modulus_std', 'transmittance']
+        
+        if not all(col in particle_df.columns for col in particle_cols):
+            raise ValueError("particle_df缺少必要列")
+        if not all(col in pore_df.columns for col in pore_cols):
+            raise ValueError("pore_df缺少必要列")
+        if not all(col in pva_df.columns for col in pva_cols):
+            raise ValueError("pva_df缺少必要列")
+        
+        # 检查数据类型
+        for df in [particle_df, pore_df, pva_df]:
+            if not df['concentration'].dtype in [np.float64, np.int64]:
+                raise ValueError("concentration列应为数值类型")
+        
+        # 检查缺失值
+        for df, name in [(particle_df, 'particle_df'), (pore_df, 'pore_df'), (pva_df, 'pva_df')]:
+            if df.isnull().any().any():
+                raise ValueError(f"{name}包含缺失值")
+        
+        # 检查浓度值范围
+        if not (particle_df['concentration'] > 0).all() or not (pore_df['concentration'] > 0).all() or not (pva_df['concentration'] > 0).all():
+            raise ValueError("浓度值应为正")
+        
+        print("[INFO] 数据验证通过")
+        return True
+    except Exception as e:
+        print(f"[ERROR] 数据验证失败: {e}")
+        return False
+
+# ========= 数据增强函数 =========
+def expand_concentration_range(data, target_samples=200, noise_level=0.02):
+    """根据目标样本数扩增数据"""
+    current_samples = len(data)
+    expansion_factor = max(1, (target_samples - current_samples) // current_samples)
+    new_rows = []
+    for _, row in data.iterrows():
+        for _ in range(expansion_factor):
+            new_row = row.copy()
+            new_row['concentration'] += np.random.normal(0, 0.01)
+            for col in ['pore_mean', 'particle_mean', 'density', 'volume_shrinkage']:
+                new_row[col] += np.random.normal(0, noise_level * row[col])
+            new_row['pore_particle_ratio'] = new_row['pore_mean'] / new_row['particle_mean']
+            new_row['pore_particle_diff'] = new_row['pore_mean'] - new_row['particle_mean']
+            for target in ['modulus', 'transmittance']:
+                new_row[target] += np.random.normal(0, noise_level * row[target])
+            new_rows.append(new_row)
+    expanded_df = pd.DataFrame(new_rows)
+    return pd.concat([data, expanded_df], ignore_index=True)
+
+# ========= 数据加载与预处理 =========
+def load_and_preprocess_data(expand=True, target_samples=200):
+    try:
+        particle_df = pd.read_excel("particle sizes.xlsx", sheet_name="Sheet2").iloc[1:, :]
+        particle_df.columns = ['concentration'] + [f'particle_{i}' for i in range(1, 41)] + ['particle_mean', 'particle_std']
+
+        pore_df = pd.read_excel("pore size.xlsx", sheet_name="Sheet4").iloc[1:, :]
+        pore_df.columns = ['concentration'] + [f'pore_{i}' for i in range(1, 26)] + ['pore_mean', 'pore_std']
+
+        pva_df = pd.read_excel("PVA Aerogel Data.xlsx", sheet_name="Sheet2")
+        pva_df.columns = ['concentration', 'density', 'volume_shrinkage', 'modulus', 'modulus_std', 'transmittance']
+
+        # 数据验证
+        if not validate_data(particle_df, pore_df, pva_df):
+            return None
+
+        merged_df = pd.merge(particle_df, pore_df, on='concentration', how='inner')
+        final_df = pd.merge(merged_df, pva_df, on='concentration', how='inner')
+        final_df['pore_particle_ratio'] = final_df['pore_mean'] / final_df['particle_mean']
+        final_df['pore_particle_diff'] = final_df['pore_mean'] - final_df['particle_mean']
+
+        if expand:
+            print(f"[INFO] 原始样本数: {len(final_df)}")
+            final_df = expand_concentration_range(final_df, target_samples)
+            print(f"[INFO] 扩增后样本数: {len(final_df)}")
+
+        return final_df
+    except FileNotFoundError as e:
+        print(f"[ERROR] 数据文件未找到: {e}")
+        return None
+    except Exception as e:
+        print(f"[ERROR] 数据加载或预处理出错: {e}")
+        return None
+
+# ========= 贝叶斯建模 =========
+def build_hierarchical_model(data):
+    if data is None:
+        print("[ERROR] 数据为空，无法进行贝叶斯建模")
+        return None, None
+
+    conc = data['concentration'].values
+    density = data['density'].values
+    shrinkage = data['volume_shrinkage'].values
+    pore_mean = data['pore_mean'].values
+    particle_mean = data['particle_mean'].values
+    modulus = data['modulus'].values
+    transmittance = data['transmittance'].values
+
+    with pm.Model() as model:
+        beta_conc = pm.Normal('beta_conc', mu=0, sigma=1)
+        mu_pore = pm.Deterministic('mu_pore', beta_conc * conc)
+        mu_particle = pm.Deterministic('mu_particle', beta_conc * conc)
+
+        pm.Potential('constraint', pm.math.switch(mu_pore > mu_particle, 0, -1e6 * (mu_particle - mu_pore)**2))
+
+        alpha_E = pm.Normal('alpha_E', mu=0, sigma=10)
+        beta_E = pm.Normal('beta_E', mu=0, sigma=1, shape=4)
+        mu_E = alpha_E + beta_E[0]*density + beta_E[1]*shrinkage + beta_E[2]*pore_mean + beta_E[3]*particle_mean
+        sigma_E = pm.HalfNormal('sigma_E', sigma=1)
+        pm.Normal('E_obs', mu=mu_E, sigma=sigma_E, observed=modulus)
+
+        alpha_T = pm.Normal('alpha_T', mu=0, sigma=10)
+        beta_T = pm.Normal('beta_T', mu=0, sigma=1, shape=4)
+        mu_T = alpha_T + beta_T[0]*density + beta_T[1]*shrinkage + beta_T[2]*pore_mean + beta_T[3]*particle_mean
+        sigma_T = pm.HalfNormal('sigma_T', sigma=1)
+        pm.Normal('T_obs', mu=mu_T, sigma=sigma_T, observed=transmittance)
+
+        try:
+            trace = pm.sample(1000, tune=500, target_accept=0.9, chains=2, cores=2, return_inferencedata=True)
+        except Exception as e:
+            print(f"[ERROR] 贝叶斯模型采样失败: {e}")
+            return None, None
+
+    return trace, model
+
+# ========= 随机森林建模 =========
+def build_ml_models(data):
+    if data is None:
+        print("[ERROR] 数据为空，无法进行随机森林建模")
+        return None, None
+
+    features = ['concentration', 'density', 'volume_shrinkage', 'pore_mean', 'particle_mean', 'pore_particle_ratio']
+    X = StandardScaler().fit_transform(data[features])
+    y_modulus = data['modulus'].values
+    y_trans = data['transmittance'].values
+
+    try:
+        rf_modulus = RandomForestRegressor(n_estimators=100, random_state=0).fit(X, y_modulus)
+        rf_trans = RandomForestRegressor(n_estimators=100, random_state=0).fit(X, y_trans)
+
+        pred_modulus = rf_modulus.predict(X)
+        pred_trans = rf_trans.predict(X)
+
+        print("[RF] Modulus R2:", r2_score(y_modulus, pred_modulus))
+        print("[RF] Transmittance R2:", r2_score(y_trans, pred_trans))
+
+        return rf_modulus, rf_trans
+    except Exception as e:
+        print(f"[ERROR] 随机森林模型训练失败: {e}")
+        return None, None
+
+# ========= 模型诊断与后验可视化 =========
+def visualize_bayes_results(trace):
+    if trace is None:
+        print("[ERROR] 贝叶斯追踪数据为空，无法可视化")
+        return
+
+    az.plot_trace(trace, var_names=['beta_conc', 'alpha_E', 'beta_E', 'alpha_T', 'beta_T'])
+    plt.tight_layout()
+    plt.savefig("results/bayes_trace_plot.png", dpi=300)
+    plt.close()
+    summary = az.summary(trace)
+    summary.to_csv("results/bayes_summary.csv")
+    print("[INFO] 贝叶斯参数轨迹与后验已保存")
+
+# ========= SHAP 分析随机森林模型 =========
+def shap_analysis(model, X, feature_names, title):
+    if model is None:
+        print(f"[ERROR] {title}模型为空，无法进行SHAP分析")
+        return
+
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X)
+    plt.figure()
+    plt.title(f"SHAP Summary - {title}")
+    shap.summary_plot(shap_values, X, feature_names=feature_names, show=False)
+    plt.tight_layout()
+    plt.savefig(f"results/shap_summary_{title}.png", dpi=300)
+    plt.close()
+    print(f"[INFO] SHAP图已保存：{title}")
+
+# ========= 特征重要性可视化 =========
+def plot_feature_importance(model, features, title):
+    if model is None:
+        print(f"[ERROR] {title}模型为空，无法绘制特征重要性")
+        return
+
+    importances = model.feature_importances_
+    indices = np.argsort(importances)[::-1]
+    plt.figure(figsize=(10,6))
+    plt.title(f"Feature Importance - {title}")
+    sns.barplot(x=importances[indices], y=np.array(features)[indices])
+    plt.tight_layout()
+    plt.savefig(f"results/feature_importance_{title}.png", dpi=300)
+    plt.close()
+    print(f"[INFO] 特征重要性图已保存：{title}")
+
+# ========= 保存所有关键结果 =========
+def save_final_outputs(data):
+    if data is None:
+        print("[ERROR] 数据为空，无法保存")
+        return
+
+    os.makedirs("results", exist_ok=True)
+    data.to_csv("results/enhanced_dataset.csv", index=False)
+    print("[INFO] 增强后数据已保存")
+
+# ========= 主流程 =========
+def main():
+    os.makedirs("results", exist_ok=True)
+    data = load_and_preprocess_data(expand=True, target_samples=200)
+    if data is not None:
+        trace, bayes_model = build_hierarchical_model(data)
+        rf_mod, rf_trans = build_ml_models(data)
+        
+        visualize_bayes_results(trace)
+        features = ['concentration', 'density', 'volume_shrinkage', 'pore_mean', 'particle_mean', 'pore_particle_ratio']
+        X_scaled = StandardScaler().fit_transform(data[features])
+        plot_feature_importance(rf_mod, features, "Modulus")
+        plot_feature_importance(rf_trans, features, "Transmittance")
+        shap_analysis(rf_mod, X_scaled, features, "Modulus")
+        shap_analysis(rf_trans, X_scaled, features, "Transmittance")
+        save_final_outputs(data)
+    else:
+        print("[ERROR] 主流程因数据问题中止")
+
+if __name__ == "__main__":
+    main()
