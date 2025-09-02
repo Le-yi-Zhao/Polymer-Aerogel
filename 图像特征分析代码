@@ -1,5 +1,3 @@
-# 重启后环境被清空，重新导入必要模块并加载用户上传的图像文件进行修正后的分析处理（像素单位）
-
 import os
 import numpy as np
 import pandas as pd
@@ -8,16 +6,16 @@ import cv2
 from skimage import io, measure, morphology, util
 from skimage.morphology import skeletonize, remove_small_holes, remove_small_objects
 from scipy import ndimage as ndi
-import ace_tools as tools
-
+from pathlib import Path
+from skimage.segmentation import watershed
 # 图像路径
 image_files = [
-    "/mnt/data/20230831_11p_17.tif",
-    "/mnt/data/20230824_15p_18.tif",
-    "/mnt/data/20230824_14p_18.tif",
-    "/mnt/data/20230823_13p_17.tif",
-    "/mnt/data/20230823_10p_17.tif",
-    "/mnt/data/20230822_12p_21.tif"
+   r"Aerogel_SEM\20230822_12p_21.tif",
+   r"Aerogel_SEM\20230823_10p_17.tif",
+   r"Aerogel_SEM\20230823_13p_17.tif",
+   r"Aerogel_SEM\20230824_14p_18.tif",
+   r"Aerogel_SEM\20230824_15p_18.tif",
+   r"Aerogel_SEM\20230831_11p_17.tif"
 ]
 
 # 灰度读取 & 归一化到 8-bit
@@ -65,7 +63,7 @@ def distance_watershed(binary_mask):
     distance = ndi.distance_transform_edt(binary_mask)
     local_max = morphology.local_maxima(distance)
     markers, _ = ndi.label(local_max)
-    return morphology.watershed(-distance, markers, mask=binary_mask)
+    return watershed(-distance, markers, mask=binary_mask)
 
 def skeleton_metrics(solid_mask):
     skel = skeletonize(solid_mask)
@@ -128,4 +126,8 @@ for path in image_files:
     rows.append(row)
 
 df = pd.DataFrame(rows)
-tools.display_dataframe_to_user(name="最终修正分析结果（像素单位）", dataframe=df)
+print(df)
+save_dir = Path("results")
+save_dir.mkdir(exist_ok=True)
+save_path = save_dir / "最终修正分析结果.xlsx"
+df.to_excel(save_path, index=False)
